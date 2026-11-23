@@ -26,7 +26,7 @@ class DataAuditTests(unittest.TestCase):
                  "source": source, "question": f"{domain}: {kind}, question {j}?",
                  "answer": f"Answer {j}", "evidence": "Evidence",
                  "question_type": kind}
-                for kind_index, kind in enumerate(TYPES) for j in range(3)
+                for kind_index, kind in enumerate(TYPES) for j in range(4)
             ]
         self.save()
 
@@ -46,7 +46,7 @@ class DataAuditTests(unittest.TestCase):
     def test_reproducible_balanced_pilot(self):
         report, pilot = audit(self.root, seed=42)
         _, again = audit(self.root, seed=42)
-        self.assertEqual(report["rows_checked"], 24)
+        self.assertEqual(report["rows_checked"], 32)
         self.assertEqual(report["excluded_rows"], 0)
         self.assertEqual(pilot, again)
         self.assertEqual(len(pilot), 12)
