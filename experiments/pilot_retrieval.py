@@ -29,10 +29,17 @@ def split_words(text, size=256, overlap=32):
 def split_tokens(text, tokenizer, size=256, overlap=32):
     if size < 1 or overlap < 0 or overlap >= size:
         raise ValueError("chunk size must exceed overlap")
-    ids = tokenizer.encode(text, add_special_tokens=False)
+    # Tokenizing an entire novel in one call can exceed a transformer's
+    # maximum input length and cause huge intermediate allocations.
+    # Tokenize short word groups, then create globally overlapping token chunks.
+    token_ids = []
+    units = text.split()
+    for start in range(0, len(units), 128):
+        fragment = " ".join(units[start:start + 128])
+        token_ids.extend(tokenizer.encode(fragment, add_special_tokens=False))
     step = size - overlap
-    return [tokenizer.decode(ids[i:i + size], skip_special_tokens=True)
-            for i in range(0, len(ids), step) if ids[i:i + size]]
+    return [tokenizer.decode(token_ids[i:i + size], skip_special_tokens=True)
+            for i in range(0, len(token_ids), step) if token_ids[i:i + size]]
 
 
 def corpus_map(root):
