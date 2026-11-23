@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
-from pilot_retrieval import LexicalIndex, corpus_map, load_pilot, retrieve, split_words
+from pilot_retrieval import LexicalIndex, corpus_map, load_pilot, retrieve, split_words, split_tokens
 
 
 class PilotRetrievalTests(unittest.TestCase):
@@ -81,6 +81,23 @@ class PilotRetrievalTests(unittest.TestCase):
         self.pilot[1]["source"] = "Nonexistent"
         with self.assertRaisesRegex(ValueError, "does not exist"):
             retrieve(self.root, self.pilot)
+
+
+    def test_long_semantic_tokenization_is_bounded(self):
+        class FakeTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                assert len(text.split()) <= 128
+                return text.split()
+
+            def decode(self, ids, skip_special_tokens=True):
+                return " ".join(ids)
+
+        corpus = " ".join(f"word{i}" for i in range(300))
+        chunks = split_tokens(corpus, FakeTokenizer(), size=100, overlap=20)
+        self.assertEqual(len(chunks), 4)
+        self.assertTrue(chunks[0].startswith("word0 "))
+        self.assertTrue(chunks[1].startswith("word80 "))
+        self.assertTrue(chunks[-1].startswith("word240 "))
 
     def test_invalid_mode_rejected(self):
         with self.assertRaises(ValueError):
