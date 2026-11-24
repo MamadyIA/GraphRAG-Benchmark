@@ -41,7 +41,7 @@ python experiments/pilot_llm_generate.py \
   --dry-run
 ```
 
-Huit tests sont fournis et doivent réussir avant la qualification GPU. Le dry run vérifie les fichiers sans télécharger de modèle.
+Dix tests sont fournis et doivent réussir avant la qualification GPU, dont deux tests de compatibilité BatchEncoding/Tensor. Le dry run vérifie les fichiers sans télécharger de modèle.
 
 ## Essai pilote puis génération complète
 
@@ -72,3 +72,9 @@ Le programme écrit un checkpoint JSON après **chaque réponse** de façon atom
 - Ne pas publier des réponses ou métriques sans vérifier les droits sur les corpus, les licences des modèles et les contraintes de licence du benchmark.
 - Les scores ne doivent pas servir à inférer des conseils médicaux fiables ; les questions médicales sont traitées exclusivement comme benchmark.
 - Aucune fusion de `main`, aucun déploiement et aucun paiement ne sont nécessaires.
+
+## Correctif pour Transformers 5 : `BatchEncoding`
+
+Sur des versions récentes de Transformers, `apply_chat_template(..., return_tensors="pt", return_dict=True)` renvoie un objet de type `BatchEncoding`, **pas un simple tenseur**. Le générateur utilise `input_ids` et le véritable `attention_mask` quand ils sont disponibles. Il préserve la limite de tokens et la génération déterministe. Il faut synchroniser le script et les tests depuis la branche GitHub ; remplacer uniquement `tokens.shape` par `tokens['input_ids'].shape` ne suffit pas car `torch.ones_like(tokens)` et `tokens.to(...)` doivent recevoir les bons tenseurs.
+
+Lorsque l'ancienne version du script a été éditée manuellement dans Colab, la cellule 3 du notebook met les copies existantes de côté et récupère seulement les deux fichiers corrigés sans perdre les autres travaux. Le runtime gratuit T4 doit être réellement connecté et `torch.cuda.is_available()` doit renvoyer `True`.
