@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
 from pilot_llm_generate import (
-    paired_inputs, messages_for, generate_paired, export_review,
+    paired_inputs, messages_for, generate_paired, export_review, chat_inputs,
 )
 
 
@@ -108,6 +108,37 @@ class LLMGenerationTests(unittest.TestCase):
         self.write_input("bge_shared", [bad])
         with self.assertRaisesRegex(ValueError, "Top-5"):
             paired_inputs(self.root)
+
+    def test_chat_inputs_accept_batch_encoding(self):
+        import torch
+        from collections import UserDict
+
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                self_kwargs = kwargs
+                assert self_kwargs["return_dict"] is True
+                assert self_kwargs["return_tensors"] == "pt"
+                return UserDict({
+                    "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                    "attention_mask": torch.tensor([[1, 1, 0]], dtype=torch.long),
+                })
+
+        ids, mask = chat_inputs(FakeTokenizer(), [{"role": "user", "content": "hi"}], 12)
+        self.assertEqual(tuple(ids.shape), (1, 3))
+        self.assertEqual(mask.tolist(), [[1, 1, 0]])
+
+    def test_chat_inputs_accept_tensor_legacy_and_guard_length(self):
+        import torch
+
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                return torch.tensor([[7, 8, 9]], dtype=torch.long)
+
+        ids, mask = chat_inputs(FakeTokenizer(), [{"role": "user", "content": "hi"}], 3)
+        self.assertEqual(mask.tolist(), [[1, 1, 1]])
+        self.assertEqual(ids.tolist(), [[7, 8, 9]])
+        with self.assertRaisesRegex(ValueError, "no silent truncation"):
+            chat_inputs(FakeTokenizer(), [{"role": "user", "content": "hi"}], 2)
 
     def test_empty_llm_response_fails_closed(self):
         pairs = paired_inputs(self.root)
