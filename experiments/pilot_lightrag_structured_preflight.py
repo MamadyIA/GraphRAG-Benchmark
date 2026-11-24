@@ -84,12 +84,76 @@ def parse_and_convert(raw):
     return "\n".join(records + [END]), len(names), len(edges)
 
 
+def lmfe_integration():
+    """Compatibility bridge for LMFE 0.11.3 and Transformers 5.
+
+    Upstream LMFE now imports PreTrainedTokenizerBase from transformers.
+    Keep the installed packages untouched; repair only the old alias in this process.
+    """
+    from importlib import import_module
+    from types import ModuleType
+    import sys
+
+    from transformers import PreTrainedTokenizerBase
+    legacy_name = "transformers.tokenization_utils"
+    try:
+        legacy = import_module(legacy_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != legacy_name:
+            raise
+        legacy = ModuleType(legacy_name)
+        sys.modules[legacy_name] = legacy
+    if not hasattr(legacy, "PreTrainedTokenizerBase"):
+        legacy.PreTrainedTokenizerBase = PreTrainedTokenizerBase
+        print("LMFE_COMPAT: restored legacy tokenizer-base alias", flush=True)
+    from lmformatenforcer.integrations.transformers import (
+        build_token_enforcer_tokenizer_data, build_transformers_prefix_allowed_tokens_fn)
+    return build_token_enforcer_tokenizer_data, build_transformers_prefix_allowed_tokens_fn
+
+
+def check_decoder():
+    """Exercise the actual Qwen tokenizer and constrained decoder on CPU."""
+    import torch
+    from transformers import AutoTokenizer
+    from lmformatenforcer import JsonSchemaParser
+
+    build_data, build_prefix = lmfe_integration()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    data = build_data(tokenizer)
+    prefix = build_prefix(data, JsonSchemaParser(SCHEMA))
+    fixture = json.dumps({
+        "entities": [
+            {"name": "Alice", "type": "Person", "description": "Alice works."},
+            {"name": "Lab", "type": "Organization", "description": "Lab employs Alice."}
+        ],
+        "relations": [
+            {"source": "Alice", "target": "Lab", "keywords": "employment",
+             "description": "Alice works at Lab."}
+        ]
+    }, separators=(",", ":"))
+    parse_and_convert(fixture)
+    prompt = tokenizer.encode("Output JSON:", add_special_tokens=False)
+    response = tokenizer.encode(fixture, add_special_tokens=False)
+    sequence = list(prompt)
+    initial = prefix(0, torch.tensor(sequence, dtype=torch.long))
+    if tokenizer.eos_token_id in initial:
+        raise RuntimeError("Decoder permits EOS before required JSON")
+    for token in response:
+        allowed = prefix(0, torch.tensor(sequence, dtype=torch.long))
+        if token not in allowed:
+            raise RuntimeError(f"Valid JSON token rejected at output position {len(sequence)-len(prompt)}")
+        sequence.append(token)
+    allowed = prefix(0, torch.tensor(sequence, dtype=torch.long))
+    if tokenizer.eos_token_id not in allowed:
+        raise RuntimeError("Decoder does not permit EOS after complete JSON")
+    print("DECODER_PREFLIGHT_PASS", flush=True)
+
+
 def run(root, out):
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
     from lmformatenforcer import JsonSchemaParser
-    from lmformatenforcer.integrations.transformers import (
-        build_token_enforcer_tokenizer_data, build_transformers_prefix_allowed_tokens_fn)
+    build_token_enforcer_tokenizer_data, build_transformers_prefix_allowed_tokens_fn = lmfe_integration()
     from pilot_llm_generate import chat_inputs
     from pilot_retrieval import corpus_map, split_tokens
 
@@ -211,11 +275,14 @@ class Tests(unittest.TestCase):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--self-test", action="store_true")
+    p.add_argument("--check-decoder", action="store_true")
     p.add_argument("--root", type=Path)
     p.add_argument("--out", type=Path)
     args = p.parse_args()
     if args.self_test:
         unittest.main(argv=["self-test"])
+    elif args.check_decoder:
+        check_decoder()
     else:
         if args.root is None or args.out is None:
             p.error("--root and --out required")
