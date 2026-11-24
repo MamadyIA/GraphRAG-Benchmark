@@ -91,7 +91,7 @@ def save_checkpoint(path, data):
 
 
 def generate_paired(pairs, inference, output, model_name, max_new_tokens=384,
-                    max_input_tokens=3584, limit_questions=0):
+                    max_input_tokens=3584, limit_questions=0, backend="unspecified"):
     if max_new_tokens < 1 or max_input_tokens < 128 or limit_questions < 0:
         raise ValueError("invalid generation limits")
     config = {
@@ -99,6 +99,7 @@ def generate_paired(pairs, inference, output, model_name, max_new_tokens=384,
         "max_input_tokens": max_input_tokens, "prompt_version": PROMPT_VERSION,
         "retrieval_sha256": hash_data(pairs),
         "decoding": "greedy, do_sample=False",
+        "backend": backend,
     }
     run_id = hash_data(config)
     if output.exists():
@@ -171,38 +172,76 @@ def load_inference(model_name, device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; enable Colab T4 runtime")
+    if device == "tpu":
+        try:
+            import torch_tpu  # noqa: F401 - registers the 'tpu' PyTorch backend
+            torch.empty(1, device="tpu")
+        except (ImportError, RuntimeError) as exc:
+            raise RuntimeError(
+                "TorchTPU unavailable. Select a Colab TPU runtime with torch_tpu, "
+                "or use the original CUDA notebook on a T4 GPU."
+            ) from exc
     torch.manual_seed(42)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    dtype = (torch.bfloat16 if device == "tpu" else
+             torch.float16 if device == "cuda" else torch.float32)
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.float16 if device == "cuda" else torch.float32,
-        device_map=device,
-        low_cpu_mem_usage=True,
+        model_name, dtype=dtype, device_map=device, low_cpu_mem_usage=True
     )
     model.eval()
+
     def infer(messages, max_new_tokens, max_input_tokens):
-        tokens = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        raw = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True
         )
-        if tokens.shape[-1] > max_input_tokens:
-            raise ValueError(f"prompt too long ({tokens.shape[-1]} tokens); no silent truncation")
-        tokens = tokens.to(model.device)
-        with torch.inference_mode():
-            generated = model.generate(
-                input_ids=tokens, attention_mask=torch.ones_like(tokens),
-                max_new_tokens=max_new_tokens, do_sample=False,
-                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None
-                else tokenizer.eos_token_id,
+        if not isinstance(raw, list):
+            raise ValueError("chat template did not produce token IDs")
+        real_input_tokens = len(raw)
+        if real_input_tokens > max_input_tokens:
+            raise ValueError(
+                f"prompt too long ({real_input_tokens} tokens > {max_input_tokens}); "
+                "no silent truncation of evidence"
             )
-        answer_tokens = generated[0, tokens.shape[-1]:]
+        if device == "tpu":
+            # Stable shapes are important for TPU compilation. Keep generation
+            # inputs on CPU: Transformers transfers only forward tensors to TPU.
+            data = tokenizer.pad(
+                {"input_ids": [raw]},
+                padding="max_length",
+                max_length=max_input_tokens,
+                return_tensors="pt",
+            )
+            token_ids, attention_mask = data["input_ids"], data["attention_mask"]
+        else:
+            token_ids = torch.tensor([raw], dtype=torch.long, device=model.device)
+            attention_mask = torch.ones_like(token_ids)
+
+        params = {
+            "input_ids": token_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "pad_token_id": tokenizer.pad_token_id,
+        }
+        if device == "tpu":
+            params["cache_implementation"] = "static"
+        with torch.inference_mode():
+            generated = model.generate(**params)
+
+        answer_tokens = generated[0, token_ids.shape[-1]:].cpu()
         eos = model.generation_config.eos_token_id
         eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
         return {
             "answer": tokenizer.decode(answer_tokens, skip_special_tokens=True),
-            "input_tokens": int(tokens.shape[-1]),
+            "input_tokens": real_input_tokens,
             "generated_tokens": int(answer_tokens.numel()),
-            "finish_reason": "eos" if any(int(i) in eos_ids for i in answer_tokens)
-            else "length_or_other",
+            "finish_reason": (
+                "eos" if any(int(i) in eos_ids for i in answer_tokens)
+                else "length_or_other"
+            ),
         }
     return infer
 
@@ -213,7 +252,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--review", type=Path, required=True)
     p.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
-    p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    p.add_argument("--device", choices=("cpu", "cuda", "tpu"), default="cuda")
     p.add_argument("--max-new-tokens", type=int, default=384)
     p.add_argument("--max-input-tokens", type=int, default=3584)
     p.add_argument("--limit-questions", type=int, default=0)
@@ -231,7 +270,8 @@ def main():
     generator = load_inference(args.model, args.device)
     state = generate_paired(
         pairs, generator, args.output, args.model,
-        args.max_new_tokens, args.max_input_tokens, args.limit_questions
+        args.max_new_tokens, args.max_input_tokens, args.limit_questions,
+        backend=args.device
     )
     export_review(pairs, state, args.review)
     print("Checkpoint:", args.output)
