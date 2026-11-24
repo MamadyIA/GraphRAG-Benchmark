@@ -101,6 +101,15 @@ class LLMGenerationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incompatible checkpoint"):
             generate_paired(pairs, infer, path, "model-b")
 
+    def test_checkpoint_rejects_backend_switch(self):
+        pairs = paired_inputs(self.root)
+        path = self.root / "backend.json"
+        def infer(messages, max_new_tokens, max_input_tokens):
+            return {"answer": "Generated [P1]."}
+        generate_paired(pairs, infer, path, "fake", backend="cuda")
+        with self.assertRaisesRegex(ValueError, "incompatible checkpoint"):
+            generate_paired(pairs, infer, path, "fake", backend="tpu")
+
     def test_missing_top_five_fails(self):
         bad = self.make_record("bge_shared")
         bad["retrieved_chunks"] = bad["retrieved_chunks"][:-1]
