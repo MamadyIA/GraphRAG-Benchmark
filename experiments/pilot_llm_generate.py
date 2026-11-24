@@ -166,6 +166,40 @@ def export_review(pairs, state, output):
             })
 
 
+def chat_inputs(tokenizer, messages, max_input_tokens):
+    """Normalize Transformers chat-template outputs to PyTorch input tensors.
+
+    Transformers versions may return a Tensor or a BatchEncoding mapping.
+    Neither ground-truth answers nor evidence are passed to this function.
+    """
+    import torch
+
+    encoded = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True,
+        return_tensors="pt", return_dict=True,
+    )
+    if torch.is_tensor(encoded):
+        tokens = encoded
+        attention_mask = torch.ones_like(tokens)
+    else:
+        try:
+            tokens = encoded["input_ids"]
+            attention_mask = encoded.get("attention_mask")
+        except (TypeError, KeyError, AttributeError) as exc:
+            raise TypeError("chat template must return Tensor or encoding with input_ids") from exc
+        if attention_mask is None:
+            attention_mask = torch.ones_like(tokens)
+    if not torch.is_tensor(tokens) or not torch.is_tensor(attention_mask):
+        raise TypeError("input_ids and attention_mask must be PyTorch tensors")
+    if tokens.ndim != 2 or attention_mask.shape != tokens.shape:
+        raise ValueError("expected aligned 2D token and attention-mask tensors")
+    if tokens.shape[-1] > max_input_tokens:
+        raise ValueError(
+            f"prompt too long ({tokens.shape[-1]} tokens); no silent truncation"
+        )
+    return tokens, attention_mask
+
+
 def load_inference(model_name, device):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -181,15 +215,12 @@ def load_inference(model_name, device):
     )
     model.eval()
     def infer(messages, max_new_tokens, max_input_tokens):
-        tokens = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
-        )
-        if tokens.shape[-1] > max_input_tokens:
-            raise ValueError(f"prompt too long ({tokens.shape[-1]} tokens); no silent truncation")
+        tokens, attention_mask = chat_inputs(tokenizer, messages, max_input_tokens)
         tokens = tokens.to(model.device)
+        attention_mask = attention_mask.to(model.device)
         with torch.inference_mode():
             generated = model.generate(
-                input_ids=tokens, attention_mask=torch.ones_like(tokens),
+                input_ids=tokens, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None
                 else tokenizer.eos_token_id,
