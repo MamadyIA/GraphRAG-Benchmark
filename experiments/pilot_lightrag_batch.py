@@ -18,6 +18,42 @@ SOURCES = {"Medical": ("medical", 1030), "Novel-10146": ("novel", 231),
            "Novel-5956": ("novel", 271)}
 
 
+# Internal graph extraction budget, distinct from the 384-token final answer budget.
+GENERATION_CAPS = (2048, 3072)
+COMPLETION_MARKER = "<|COMPLETE|>"
+CHECKPOINT_VERSION = "v2"
+
+
+def classify_generation(answer, generated_tokens, cap, require_marker, eos_reached):
+    """Never publish an incomplete extraction or an unterminated summary."""
+    answer = answer.strip()
+    if not answer:
+        return "empty"
+    if require_marker and answer.endswith(COMPLETION_MARKER):
+        return "complete_marker"
+    if generated_tokens >= cap and not eos_reached:
+        return "token_cap"
+    if require_marker:
+        return "missing_completion_marker"
+    if eos_reached:
+        return "complete_eos"
+    return "unexpected_stop"
+
+
+def bounded_generation(generate_once, require_marker):
+    """Retry only a length-limited response; all other anomalies fail closed."""
+    for cap in GENERATION_CAPS:
+        answer, n_tokens, eos_reached = generate_once(cap, require_marker)
+        reason = classify_generation(answer, n_tokens, cap, require_marker, eos_reached)
+        if reason in ("complete_marker", "complete_eos"):
+            return answer.strip()
+        if reason == "token_cap" and cap != GENERATION_CAPS[-1]:
+            print(f"RETRY_LENGTH: {cap} -> {GENERATION_CAPS[-1]} tokens", flush=True)
+            continue
+        raise RuntimeError(f"Incomplete graph LLM output: {reason}; cap={cap}; "
+                           f"tokens={n_tokens}; tail={answer[-300:]!r}")
+
+
 def digest(obj):
     return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True,
                                     separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -98,6 +134,7 @@ async def run(workdir, root, folder, source, batch_size):
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from lightrag import LightRAG
     from lightrag.utils import EmbeddingFunc, compute_mdhash_id
+    from lightrag.prompt import PROMPTS
     from pilot_llm_generate import chat_inputs
     from pilot_retrieval import corpus_map, split_tokens
 
@@ -105,6 +142,8 @@ async def run(workdir, root, folder, source, batch_size):
         raise RuntimeError("Enable a CUDA GPU in Colab")
     if version("lightrag-hku") != "1.4.11":
         raise RuntimeError("Expected lightrag-hku==1.4.11")
+    if PROMPTS["DEFAULT_COMPLETION_DELIMITER"] != COMPLETION_MARKER:
+        raise RuntimeError("LightRAG completion delimiter changed")
     workdir.mkdir(parents=True)
     domain, expected_count = SOURCES[source]
     source_text = corpus_map(root)[(domain, source)]
@@ -121,11 +160,13 @@ async def run(workdir, root, folder, source, batch_size):
             "file_path": f"{source}/chunk-{index:06d}",
             "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         })
-    config = {"protocol": "shared-chunks-batch-v1", "source": source,
+    config = {"protocol": "shared-chunks-batch-v2", "source": source,
               "domain": domain, "total_chunks": expected_count,
               "manifest_sha256": digest(manifest), "llm": LLM, "embedding": EMBED,
               "chunk_size": 256, "overlap": 32, "max_input_tokens": 8192,
-              "max_new_tokens": 1024, "gleaning": 0, "dtype": "float16",
+              "generation_caps": list(GENERATION_CAPS), "completion_marker": COMPLETION_MARKER,
+              "require_extract_marker": True, "stop_on_marker": True,
+              "gleaning": 0, "dtype": "float16",
               "versions": {name: version(name) for name in
                   ("lightrag-hku", "transformers", "torch", "sentence-transformers")}}
     folder.mkdir(parents=True, exist_ok=True)
@@ -151,29 +192,43 @@ async def run(workdir, root, folder, source, batch_size):
         messages.extend(history_messages or [])
         messages.append({"role": "user", "content": prompt})
         async with lock:
-            if len(calls) >= max(30, 8 * batch_size):
-                raise RuntimeError("Batch call budget exhausted; previous checkpoint preserved")
             tokens, mask = chat_inputs(tokenizer, messages, 8192)
             tokens, mask = tokens.to(model.device), mask.to(model.device)
-            started = time.perf_counter()
-            with torch.inference_mode():
-                out = model.generate(
-                    input_ids=tokens, attention_mask=mask, max_new_tokens=1024,
-                    do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None
-                    else tokenizer.eos_token_id,
-                )
-            new = out[0, tokens.shape[-1]:]
-            answer = tokenizer.decode(new, skip_special_tokens=True).strip()
-            record = {"call": len(calls) + 1, "input_tokens": int(tokens.shape[-1]),
-                      "generated_tokens": int(new.numel()),
-                      "elapsed_seconds": round(time.perf_counter() - started, 3),
-                      "hit_token_cap": int(new.numel()) >= 1024}
-            calls.append(record)
-            print("LLM:", record, flush=True)
-            if not answer or record["hit_token_cap"]:
-                raise RuntimeError("Empty or potentially truncated graph extraction/keyword output")
-            return answer
+            # The upstream extraction system prompt requires the literal marker.
+            require_marker = COMPLETION_MARKER in (system_prompt or "")
+            eos = model.generation_config.eos_token_id
+            eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
+
+            def generate_once(cap, require_marker):
+                if len(calls) >= max(30, 8 * batch_size):
+                    raise RuntimeError("Batch call budget exhausted; previous checkpoint preserved")
+                params = {}
+                if require_marker:
+                    params.update(stop_strings=[COMPLETION_MARKER], tokenizer=tokenizer)
+                started = time.perf_counter()
+                with torch.inference_mode():
+                    out = model.generate(
+                        input_ids=tokens, attention_mask=mask, max_new_tokens=cap,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None
+                        else tokenizer.eos_token_id,
+                        **params,
+                    )
+                new = out[0, tokens.shape[-1]:]
+                answer = tokenizer.decode(new, skip_special_tokens=True).strip()
+                n_tokens = int(new.numel())
+                eos_reached = n_tokens > 0 and int(new[-1].item()) in eos_ids
+                reason = classify_generation(answer, n_tokens, cap, require_marker, eos_reached)
+                record = {"call": len(calls) + 1, "input_tokens": int(tokens.shape[-1]),
+                          "generated_tokens": n_tokens, "max_new_tokens": cap,
+                          "elapsed_seconds": round(time.perf_counter() - started, 3),
+                          "hit_token_cap": n_tokens >= cap, "eos_reached": eos_reached,
+                          "requires_completion_marker": require_marker, "finish_reason": reason}
+                calls.append(record)
+                print("LLM:", record, flush=True)
+                return answer, n_tokens, eos_reached
+
+            return bounded_generation(generate_once, require_marker)
 
     async def embeddings(texts, **kwargs):
         async with lock:
@@ -190,6 +245,7 @@ async def run(workdir, root, folder, source, batch_size):
         chunk_token_size=256,
         chunk_overlap_token_size=32,
         llm_model_max_async=1,
+        default_llm_timeout=360,
         embedding_func_max_async=1,
         embedding_batch_num=4,
         entity_extract_max_gleaning=0,
@@ -248,5 +304,5 @@ if __name__ == "__main__":
         parser.error("batch-size must be 1..25")
     with tempfile.TemporaryDirectory(prefix="lightrag_batch_") as scratch:
         asyncio.run(run(Path(scratch) / "graph", args.root,
-                        args.checkpoint_dir / (args.source + "-v1"),
+                        args.checkpoint_dir / (args.source + "-" + CHECKPOINT_VERSION),
                         args.source, args.batch_size))
