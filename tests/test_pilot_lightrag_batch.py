@@ -6,7 +6,9 @@ import unittest
 from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
-from pilot_lightrag_batch import check_state, digest, publish, restore_latest
+from pilot_lightrag_batch import (check_state, digest, publish, restore_latest,
+                                  bounded_generation, classify_generation,
+                                  COMPLETION_MARKER, GENERATION_CAPS)
 
 
 class BatchCheckpointTests(unittest.TestCase):
@@ -76,6 +78,52 @@ class BatchCheckpointTests(unittest.TestCase):
     def test_digest_is_stable(self):
         self.assertEqual(digest({"a": 1, "b": 2}), digest({"b": 2, "a": 1}))
         self.assertNotEqual(digest({"a": 1}), digest({"a": 2}))
+
+
+class GenerationCompletionTests(unittest.TestCase):
+    def test_marker_completes_even_at_cap(self):
+        self.assertEqual(classify_generation("entity\n" + COMPLETION_MARKER,
+                                             2048, 2048, True, False),
+                         "complete_marker")
+
+    def test_retry_length_then_marker(self):
+        attempted = []
+        def generate(cap, marker):
+            attempted.append(cap)
+            self.assertTrue(marker)
+            return ("entity", cap, False) if len(attempted) == 1 else (
+                "entity\n" + COMPLETION_MARKER, 2200, False)
+        self.assertTrue(bounded_generation(generate, True).endswith(COMPLETION_MARKER))
+        self.assertEqual(attempted, list(GENERATION_CAPS))
+
+    def test_hard_cap_fails_closed(self):
+        attempted = []
+        def generate(cap, marker):
+            attempted.append(cap)
+            return "unfinished", cap, False
+        with self.assertRaisesRegex(RuntimeError, "token_cap"):
+            bounded_generation(generate, True)
+        self.assertEqual(attempted, list(GENERATION_CAPS))
+
+    def test_eos_without_extraction_marker_fails(self):
+        attempted = []
+        def generate(cap, marker):
+            attempted.append(cap)
+            return "incomplete", 100, True
+        with self.assertRaisesRegex(RuntimeError, "missing_completion_marker"):
+            bounded_generation(generate, True)
+        self.assertEqual(len(attempted), 1)
+
+    def test_summary_eos_and_empty_rejected(self):
+        self.assertEqual(bounded_generation(lambda cap, mark: ("summary", 10, True), False),
+                         "summary")
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            bounded_generation(lambda cap, mark: ("", 1, True), True)
+
+    def test_marker_not_at_end_is_not_completion(self):
+        self.assertEqual(classify_generation("entity" + COMPLETION_MARKER + "extra",
+                                             100, 2048, True, True),
+                         "missing_completion_marker")
 
 
 if __name__ == "__main__":
